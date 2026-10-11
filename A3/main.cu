@@ -19,25 +19,45 @@
 // ============================================================================
 // CUDA KERNELS
 // ============================================================================
+__global__ void init_kernel(int *tent, int *state, int *in_far, int *in_settled, int N, int source)
+{
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= N)
+        return;
+
+    tent[v] = (v == source) ? 0 : INF;
+    state[v] = (v == source) ? STATE_NEAR : STATE_NONE;
+    in_far[v] = 0;
+    in_settled[v] = 0;
+}
 
 // ============================================================================
 // SINGLE SOURCE DELTA-STEPPING DRIVER
 // ============================================================================
 
 void run_delta_stepping_single_source(
-    /*
-
-
-
-
-    */
-)
+    const int *d_offsets, const int *d_neighs, const int *d_weights,
+    int N, int source, int delta,
+    int *d_tent, int *d_state, int *d_in_far, int *d_in_settled,
+    int *d_near_r, int *d_near_w, int *d_far_r, int *d_far_w, int *d_settled,
+    int *d_near_w_cnt, int *d_far_cnt, int *d_settled_cnt, int *d_dmin)
 {
     /*
-    for adaptive delta, print from within this function. That would be easy.
+    for adaptive delta, print from within this function. That would be easy.*/
+    int grid_n = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    init_kernel<<<grid_n, BLOCK_SIZE>>>(d_tent, d_state, d_in_far, d_in_settled, N, source);
 
+    // reset counters
+    cudaMemset(d_near_w_cnt, 0, sizeof(int));
+    cudaMemset(d_far_cnt, 0, sizeof(int));
+    cudaMemset(d_settled_cnt, 0, sizeof(int));
 
-    */
+    // near queue starts with just the source
+    cudaMemcpy(d_near_r, &source, sizeof(int), cudaMemcpyHostToDevice);
+    int near_cnt = 1; // host-side size of the read queue
+
+    // first window is [0, delta]
+    int cutoff = (delta >= INF) ? INF - 1 : delta;
 }
 
 // ============================================================================
@@ -111,23 +131,23 @@ int main(int argc, char **argv)
 
     /* ToDo : BEGIN */
 
-    int *d_state = nullptr;      // STATE_NONE / STATE_NEAR / STATE_FAR
-    int *d_in_far = nullptr;     // 1 if vertex has an entry in the far array
-    int *d_in_settled = nullptr; // 1 if vertex is already in the settled list
+    int *d_state = nullptr; // STATE_NONE / STATE_NEAR / STATE_FAR
+    int *d_in_far = nullptr;
+    int *d_in_settled = nullptr;
     cudaMalloc(&d_state, N * sizeof(int));
     cudaMalloc(&d_in_far, N * sizeof(int));
     cudaMalloc(&d_in_settled, N * sizeof(int));
 
-    int *d_near_r = nullptr, *d_near_w = nullptr; // near queue: read side / write side (swapped each iteration)
-    int *d_far_r = nullptr, *d_far_w = nullptr;   // far queue: read side / write side (swapped at each filter)
-    int *d_settled = nullptr;                     // vertices processed in the current window
+    int *d_near_r = nullptr, *d_near_w = nullptr;
+    int *d_far_r = nullptr, *d_far_w = nullptr;
+    int *d_settled = nullptr;
     cudaMalloc(&d_near_r, N * sizeof(int));
     cudaMalloc(&d_near_w, N * sizeof(int));
     cudaMalloc(&d_far_r, N * sizeof(int));
     cudaMalloc(&d_far_w, N * sizeof(int));
     cudaMalloc(&d_settled, N * sizeof(int));
 
-    int *d_near_cnt = nullptr; // next-near count / promoted count
+    int *d_near_cnt = nullptr;
     int *d_far_cnt = nullptr;
     int *d_settled_cnt = nullptr;
     int *d_dmin = nullptr;
@@ -145,16 +165,11 @@ int main(int argc, char **argv)
         outfile << source << "\n";
 
         run_delta_stepping_single_source(
-            /*
-            ToDo
-
-
-
-
-
-
-            */
-        );
+            d_offsets, d_neighs, d_weights,
+            N, source, delta_mode,
+            d_tent, d_state, d_in_far, d_in_settled,
+            d_near_r, d_near_w, d_far_r, d_far_w, d_settled,
+            d_near_cnt, d_far_cnt, d_settled_cnt, d_dmin);
 
         cudaMemcpy(h_tent, d_tent, N * sizeof(int), cudaMemcpyDeviceToHost);
 
