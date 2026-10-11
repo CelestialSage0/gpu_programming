@@ -107,6 +107,49 @@ __global__ void heavy_kernel(const int *offsets, const int *neighs, const int *w
     }
 }
 
+// Smallest tentative distance among valid far entries.
+__global__ void min_far_kernel(const int *far_q, int far_cnt, const int *tent, const int *state, int *dmin)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= far_cnt)
+        return;
+
+    int v = far_q[t];
+    if (state[v] == STATE_FAR) // skip stale entries
+        atomicMin(dmin, tent[v]);
+}
+
+// Promote far vertices with tent <= cutoff into near; keep the rest in far; drop stale entries.
+__global__ void filter_kernel(const int *far_in, int far_cnt,
+                              int *far_out, int *far_out_cnt,
+                              int *near_out, int *near_out_cnt,
+                              const int *tent, int *state, int *in_far, int cutoff)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= far_cnt)
+        return;
+
+    int v = far_in[t];
+
+    if (state[v] == STATE_FAR)
+    {
+        if (tent[v] <= cutoff) // promote
+        {
+            state[v] = STATE_NEAR;
+            in_far[v] = 0;
+            near_out[atomicAdd(near_out_cnt, 1)] = v;
+        }
+        else // keep in far
+        {
+            far_out[atomicAdd(far_out_cnt, 1)] = v;
+        }
+    }
+    else // stale entry: v already moved to near earlier
+    {
+        in_far[v] = 0;
+    }
+}
+
 // ============================================================================
 // SINGLE SOURCE DELTA-STEPPING DRIVER
 // ============================================================================
@@ -120,6 +163,9 @@ void run_delta_stepping_single_source(
 {
     /*
     for adaptive delta, print from within this function. That would be easy.*/
+    if (delta < 0)
+        delta = 0; // static filter
+
     int grid_n = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
     init_kernel<<<grid_n, BLOCK_SIZE>>>(d_tent, d_state, d_in_far, d_in_settled, N, source);
 
@@ -132,35 +178,68 @@ void run_delta_stepping_single_source(
 
     int cutoff = (delta >= INF) ? INF - 1 : delta;
 
-    while (near_cnt > 0)
+    while (true)
     {
-        cudaMemset(d_near_w_cnt, 0, sizeof(int));
+        // ---- light phase: repeat until the near queue is empty ----
+        while (near_cnt > 0)
+        {
+            cudaMemset(d_near_w_cnt, 0, sizeof(int));
 
-        int grid = (near_cnt + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        light_kernel<<<grid, BLOCK_SIZE>>>(
-            d_offsets, d_neighs, d_weights,
-            d_tent, d_state, d_in_far, d_in_settled,
-            d_near_r, near_cnt,
-            d_near_w, d_near_w_cnt,
-            d_far_r, d_far_cnt,
-            d_settled, d_settled_cnt,
-            delta, cutoff);
+            int grid = (near_cnt + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            light_kernel<<<grid, BLOCK_SIZE>>>(
+                d_offsets, d_neighs, d_weights,
+                d_tent, d_state, d_in_far, d_in_settled,
+                d_near_r, near_cnt,
+                d_near_w, d_near_w_cnt,
+                d_far_r, d_far_cnt,
+                d_settled, d_settled_cnt,
+                delta, cutoff);
 
+            cudaMemcpy(&near_cnt, d_near_w_cnt, sizeof(int), cudaMemcpyDeviceToHost);
+            std::swap(d_near_r, d_near_w); // what we just wrote is what we read next
+        }
+
+        // ---- heavy phase: once per window ----
+        int settled_cnt;
+        cudaMemcpy(&settled_cnt, d_settled_cnt, sizeof(int), cudaMemcpyDeviceToHost);
+        if (settled_cnt > 0)
+        {
+            int grid = (settled_cnt + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            heavy_kernel<<<grid, BLOCK_SIZE>>>(
+                d_offsets, d_neighs, d_weights,
+                d_tent, d_state, d_in_far, d_in_settled,
+                d_settled, settled_cnt,
+                d_far_r, d_far_cnt, delta);
+            cudaMemset(d_settled_cnt, 0, sizeof(int));
+        }
+
+        // ---- window transition: pull the next window out of far ----
+        int far_cnt;
+        cudaMemcpy(&far_cnt, d_far_cnt, sizeof(int), cudaMemcpyDeviceToHost);
+        if (far_cnt == 0)
+            break; // nothing left anywhere -> done
+
+        int dmin = INF;
+        cudaMemcpy(d_dmin, &dmin, sizeof(int), cudaMemcpyHostToDevice);
+        int grid = (far_cnt + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        min_far_kernel<<<grid, BLOCK_SIZE>>>(d_far_r, far_cnt, d_tent, d_state, d_dmin);
+        cudaMemcpy(&dmin, d_dmin, sizeof(int), cudaMemcpyDeviceToHost);
+        if (dmin == INF)
+            break; // only stale entries were left
+
+        long long c = (long long)dmin + delta;
+        cutoff = (c >= INF) ? INF - 1 : (int)c;
+
+        cudaMemset(d_near_w_cnt, 0, sizeof(int)); // count of promoted vertices
+        cudaMemset(d_far_cnt, 0, sizeof(int));    // becomes the new far count
+        filter_kernel<<<grid, BLOCK_SIZE>>>(
+            d_far_r, far_cnt,
+            d_far_w, d_far_cnt,
+            d_near_r, d_near_w_cnt,
+            d_tent, d_state, d_in_far, cutoff);
+
+        std::swap(d_far_r, d_far_w); // survivors become the far queue
         cudaMemcpy(&near_cnt, d_near_w_cnt, sizeof(int), cudaMemcpyDeviceToHost);
-        std::swap(d_near_r, d_near_w); // what we just wrote is what we read next
-    }
-
-    int settled_cnt;
-    cudaMemcpy(&settled_cnt, d_settled_cnt, sizeof(int), cudaMemcpyDeviceToHost);
-    if (settled_cnt > 0)
-    {
-        int grid = (settled_cnt + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        heavy_kernel<<<grid, BLOCK_SIZE>>>(
-            d_offsets, d_neighs, d_weights,
-            d_tent, d_state, d_in_far, d_in_settled,
-            d_settled, settled_cnt,
-            d_far_r, d_far_cnt, delta);
-        cudaMemset(d_settled_cnt, 0, sizeof(int));
     }
 }
 
