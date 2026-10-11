@@ -31,6 +31,51 @@ __global__ void init_kernel(int *tent, int *state, int *in_far, int *in_settled,
     in_settled[v] = 0;
 }
 
+__global__ void light_kernel(const int *offsets, const int *neighs, const int *weights,
+                             int *tent, int *state, int *in_far, int *in_settled,
+                             const int *near_r, int near_cnt,
+                             int *near_w, int *near_w_cnt,
+                             int *far_q, int *far_cnt,
+                             int *settled, int *settled_cnt,
+                             int delta, int cutoff)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= near_cnt)
+        return;
+
+    int u = near_r[t];
+    atomicExch(&state[u], STATE_NONE);
+    int du = __ldcg(&tent[u]);
+
+    if (atomicExch(&in_settled[u], 1) == 0)
+        settled[atomicAdd(settled_cnt, 1)] = u;
+
+    for (int e = offsets[u]; e < offsets[u + 1]; ++e)
+    {
+        int w = weights[e];
+        if (w > delta)
+            continue;
+
+        int v = neighs[e];
+        int nd = du + w;
+
+        if (atomicMin(&tent[v], nd) > nd)
+        {
+            if (nd <= cutoff)
+            {
+                if (atomicExch(&state[v], STATE_NEAR) != STATE_NEAR)
+                    near_w[atomicAdd(near_w_cnt, 1)] = v;
+            }
+            else
+            {
+                if (atomicCAS(&state[v], STATE_NONE, STATE_FAR) == STATE_NONE)
+                    if (atomicExch(&in_far[v], 1) == 0)
+                        far_q[atomicAdd(far_cnt, 1)] = v;
+            }
+        }
+    }
+}
+
 // ============================================================================
 // SINGLE SOURCE DELTA-STEPPING DRIVER
 // ============================================================================
@@ -47,17 +92,32 @@ void run_delta_stepping_single_source(
     int grid_n = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
     init_kernel<<<grid_n, BLOCK_SIZE>>>(d_tent, d_state, d_in_far, d_in_settled, N, source);
 
-    // reset counters
     cudaMemset(d_near_w_cnt, 0, sizeof(int));
     cudaMemset(d_far_cnt, 0, sizeof(int));
     cudaMemset(d_settled_cnt, 0, sizeof(int));
 
-    // near queue starts with just the source
     cudaMemcpy(d_near_r, &source, sizeof(int), cudaMemcpyHostToDevice);
-    int near_cnt = 1; // host-side size of the read queue
+    int near_cnt = 1;
 
-    // first window is [0, delta]
     int cutoff = (delta >= INF) ? INF - 1 : delta;
+
+    while (near_cnt > 0)
+    {
+        cudaMemset(d_near_w_cnt, 0, sizeof(int));
+
+        int grid = (near_cnt + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        light_kernel<<<grid, BLOCK_SIZE>>>(
+            d_offsets, d_neighs, d_weights,
+            d_tent, d_state, d_in_far, d_in_settled,
+            d_near_r, near_cnt,
+            d_near_w, d_near_w_cnt,
+            d_far_r, d_far_cnt,
+            d_settled, d_settled_cnt,
+            delta, cutoff);
+
+        cudaMemcpy(&near_cnt, d_near_w_cnt, sizeof(int), cudaMemcpyDeviceToHost);
+        std::swap(d_near_r, d_near_w); // what we just wrote is what we read next
+    }
 }
 
 // ============================================================================
@@ -195,7 +255,6 @@ int main(int argc, char **argv)
     cudaFree(d_near_w);
     cudaFree(d_far_r);
     cudaFree(d_far_w);
-    cudaFree(d_settled);
     cudaFree(d_settled);
     cudaFree(d_near_cnt);
     cudaFree(d_far_cnt);
