@@ -76,6 +76,37 @@ __global__ void light_kernel(const int *offsets, const int *neighs, const int *w
     }
 }
 
+__global__ void heavy_kernel(const int *offsets, const int *neighs, const int *weights,
+                             int *tent, int *state, int *in_far, int *in_settled,
+                             const int *settled, int settled_cnt,
+                             int *far_q, int *far_cnt, int delta)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= settled_cnt)
+        return;
+
+    int u = settled[t];
+    int du = tent[u];
+    in_settled[u] = 0; // reset the flag for the next window
+
+    for (int e = offsets[u]; e < offsets[u + 1]; ++e)
+    {
+        int w = weights[e];
+        if (w <= delta)
+            continue; // light edge, already done
+
+        int v = neighs[e];
+        int nd = du + w;
+
+        if (atomicMin(&tent[v], nd) > nd) // improved; always lands beyond the window -> far
+        {
+            if (atomicCAS(&state[v], STATE_NONE, STATE_FAR) == STATE_NONE)
+                if (atomicExch(&in_far[v], 1) == 0)
+                    far_q[atomicAdd(far_cnt, 1)] = v;
+        }
+    }
+}
+
 // ============================================================================
 // SINGLE SOURCE DELTA-STEPPING DRIVER
 // ============================================================================
@@ -117,6 +148,19 @@ void run_delta_stepping_single_source(
 
         cudaMemcpy(&near_cnt, d_near_w_cnt, sizeof(int), cudaMemcpyDeviceToHost);
         std::swap(d_near_r, d_near_w); // what we just wrote is what we read next
+    }
+
+    int settled_cnt;
+    cudaMemcpy(&settled_cnt, d_settled_cnt, sizeof(int), cudaMemcpyDeviceToHost);
+    if (settled_cnt > 0)
+    {
+        int grid = (settled_cnt + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        heavy_kernel<<<grid, BLOCK_SIZE>>>(
+            d_offsets, d_neighs, d_weights,
+            d_tent, d_state, d_in_far, d_in_settled,
+            d_settled, settled_cnt,
+            d_far_r, d_far_cnt, delta);
+        cudaMemset(d_settled_cnt, 0, sizeof(int));
     }
 }
 
